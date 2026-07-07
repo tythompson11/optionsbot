@@ -88,10 +88,14 @@ def get_atm_contract(symbol: str, direction: str):
     chain = tk.option_chain(expiry)
     table = chain.calls if direction == "call" else chain.puts
 
-    spot_hist = tk.history(period="1d")
-    if spot_hist.empty:
-        raise ValueError(f"No spot price data for {symbol}")
-    spot_price = float(spot_hist["Close"].iloc[-1])
+    # Use a live quote for spot price instead of the (often stale) daily candle
+    try:
+        spot_price = float(tk.fast_info["last_price"])
+    except Exception:
+        spot_hist = tk.history(period="1d")
+        if spot_hist.empty:
+            raise ValueError(f"No spot price data for {symbol}")
+        spot_price = float(spot_hist["Close"].iloc[-1])
 
     table = table.copy()
     table["diff"] = (table["strike"] - spot_price).abs()
