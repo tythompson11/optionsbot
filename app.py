@@ -6,17 +6,17 @@ Signal-only. No trade execution. No Alpaca dependency.
 Flow:
   1. TradingView Pine Script alert fires -> POSTs JSON to /webhook
   2. This app validates the symbol against WATCHLIST
-  3. yfinance is used to find the nearest Friday expiry + ATM contract
+  3. Tradier (real-time market data) is used to find the nearest Friday
+     expiry + ATM contract
   4. Stop loss / take profit are computed as a % of the option premium
   5. A formatted signal is posted to Discord via webhook
 """
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import requests
-import yfinance as yf
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -36,10 +36,8 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # optional shared secret from Trad
 DEFAULT_STOP_PCT = float(os.getenv("DEFAULT_STOP_PCT", "30"))    # stop loss = -30% of premium
 DEFAULT_TARGET_PCT = float(os.getenv("DEFAULT_TARGET_PCT", "50"))  # take profit = +50% of premium
 
-# Ticker aliases: what TradingView calls a symbol -> what yfinance expects
-TICKER_ALIASES = {
-    "SPX": "^SPX",     # S&P 500 index (cash-settled options chain is on ^SPX in yfinance)
-}
+TRADIER_API_KEY = os.getenv("TRADIER_API_KEY")
+TRADIER_BASE_URL = "https://api.tradier.com/v1"  # production = real-time data
 
 WATCHLIST = {
     "AMD", "INTC", "NVDA", "QQQ", "SPY",
@@ -47,15 +45,70 @@ WATCHLIST = {
 }
 
 # ---------------------------------------------------------------------------
+# Tradier helpers
+# ---------------------------------------------------------------------------
+
+def tradier_get(path: str, params: dict):
+    if not TRADIER_API_KEY:
+        raise RuntimeError("TRADIER_API_KEY is not set")
+
+    headers = {
+        "Authorization": f"Bearer {TRADIER_API_KEY}",
+        "Accept": "application/json",
+    }
+    resp = requests.get(f"{TRADIER_BASE_URL}{path}", headers=headers, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_spot_price(symbol: str) -> float:
+    data = tradier_get("/markets/quotes", {"symbols": symbol})
+    quote = data.get("quotes", {}).get("quote")
+    if quote is None:
+        raise ValueError(f"No quote data for {symbol}")
+    if isinstance(quote, list):
+        quote = quote[0]
+    price = quote.get("last") or quote.get("close")
+    if price is None:
+        raise ValueError(f"No usable price field for {symbol}")
+    return float(price)
+
+
+def get_expirations(symbol: str):
+    data = tradier_get("/markets/options/expirations", {"symbol": symbol})
+    dates = data.get("expirations")
+    if not dates:
+        return []
+    dates = dates.get("date")
+    if dates is None:
+        return []
+    if isinstance(dates, str):
+        return [dates]
+    return dates
+
+
+def get_option_chain(symbol: str, expiry: str):
+    data = tradier_get(
+        "/markets/options/chains",
+        {"symbol": symbol, "expiration": expiry, "greeks": "false"},
+    )
+    options = data.get("options")
+    if not options:
+        return []
+    options = options.get("option")
+    if options is None:
+        return []
+    if isinstance(options, dict):
+        return [options]
+    return options
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
-
-
-def yf_ticker_for(symbol: str) -> str:
-    return TICKER_ALIASES.get(symbol, symbol)
 
 
 def nearest_friday_expiry(available_expiries):
@@ -74,47 +127,45 @@ def nearest_friday_expiry(available_expiries):
 def get_atm_contract(symbol: str, direction: str):
     """
     direction: 'call' or 'put'
-    Returns dict with strike, expiry, last_price, bid, ask, contract_symbol
+    Returns dict with strike, expiry, premium, bid, ask, contract_symbol, spot_price
     """
-    yf_symbol = yf_ticker_for(symbol)
-    tk = yf.Ticker(yf_symbol)
-
-    expiries = tk.options
+    expiries = get_expirations(symbol)
     if not expiries:
         raise ValueError(f"No options data available for {symbol}")
 
     expiry = nearest_friday_expiry(expiries)
 
-    chain = tk.option_chain(expiry)
-    table = chain.calls if direction == "call" else chain.puts
+    chain = get_option_chain(symbol, expiry)
+    if not chain:
+        raise ValueError(f"No option chain returned for {symbol} {expiry}")
 
-    # Use a live quote for spot price instead of the (often stale) daily candle
-    try:
-        spot_price = float(tk.fast_info["last_price"])
-    except Exception:
-        spot_hist = tk.history(period="1d")
-        if spot_hist.empty:
-            raise ValueError(f"No spot price data for {symbol}")
-        spot_price = float(spot_hist["Close"].iloc[-1])
+    option_type = "call" if direction == "call" else "put"
+    candidates = [o for o in chain if o.get("option_type") == option_type]
+    if not candidates:
+        raise ValueError(f"No {option_type} contracts found for {symbol} {expiry}")
 
-    table = table.copy()
-    table["diff"] = (table["strike"] - spot_price).abs()
-    row = table.sort_values("diff").iloc[0]
+    spot_price = get_spot_price(symbol)
 
-    premium = float(row["lastPrice"])
-    bid = float(row.get("bid", 0) or 0)
-    ask = float(row.get("ask", 0) or 0)
-    # prefer mid of bid/ask if both are live, otherwise fall back to lastPrice
+    best = min(candidates, key=lambda o: abs(float(o["strike"]) - spot_price))
+
+    bid = float(best.get("bid") or 0)
+    ask = float(best.get("ask") or 0)
+    last = float(best.get("last") or 0)
+
     if bid > 0 and ask > 0:
         premium = round((bid + ask) / 2, 2)
+    elif last > 0:
+        premium = round(last, 2)
+    else:
+        raise ValueError(f"No valid pricing data for {symbol} contract")
 
     return {
         "expiry": expiry,
-        "strike": float(row["strike"]),
+        "strike": float(best["strike"]),
         "premium": premium,
         "bid": bid,
         "ask": ask,
-        "contract_symbol": row.get("contractSymbol", ""),
+        "contract_symbol": best.get("symbol", ""),
         "spot_price": spot_price,
     }
 
