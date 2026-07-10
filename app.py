@@ -221,7 +221,7 @@ def webhook():
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "unauthorized"}), 401
 
-    symbol = normalize_symbol(data.get("symbol", ""))
+    symbol = normalize_symbol(data.get("ticker", ""))
     action = str(data.get("action", "")).lower()  # e.g. "buy_call", "buy_put", "long", "short"
 
     if symbol not in WATCHLIST:
